@@ -1,0 +1,21 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  build:
+    commands:
+      - set -e
+      - echo outputting git diff file...
+      - get_pr_changed_files_list.sh ${REPO_NAME} $OUTPUT_ARTIFACT_PATH
+      - mv $OUTPUT_ARTIFACT_PATH /opt/$OUTPUT_ARTIFACT_PATH
+      - ls /opt
+      - cat /opt/$OUTPUT_ARTIFACT_PATH
+
+artifacts:
+  name: ChangedFiles
+  files:
+    - $OUTPUT_ARTIFACT_PATH
+  discard-paths: no
+  base-directory: /opt

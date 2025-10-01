@@ -61,7 +61,7 @@ variable "action_triggers_artifact" {
 variable "action_triggers_json" {
   description = "the path to the action_triggers.json file in your repo, relative to the root of the repo."
   type        = string
-  default     = "/terraform/deployments/670214072732/action_triggers.json"
+  default     = "/terraform"
 }
 
 variable "output_artifact_path" {

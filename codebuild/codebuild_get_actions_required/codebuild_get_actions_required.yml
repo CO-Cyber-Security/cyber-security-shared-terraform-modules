@@ -8,13 +8,11 @@ phases:
     commands:
       - set -euo pipefail
       - echo "getting required actions..."
-
-      - : "${OUTPUT_ARTIFACT_PATH:=actions_required.json}"
-      - : "${CHANGED_FILES_ARTIFACT:=changed_files}"
-      - : "${CHANGED_FILES_JSON:=/changed_files.json}"
-      - : "${ACTION_TRIGGERS_ARTIFACT:=}"
-      - : "${ACTION_TRIGGERS_JSON:=/terraform/modules/codepipeline_prodpython/action_triggers.json}"
-
+      - export OUTPUT_ARTIFACT_PATH="${OUTPUT_ARTIFACT_PATH:-actions_required.json}"
+      - export CHANGED_FILES_ARTIFACT="${CHANGED_FILES_ARTIFACT:-changed_files}"
+      - export CHANGED_FILES_JSON="${CHANGED_FILES_JSON:-/changed_files.json}"
+      - export ACTION_TRIGGERS_ARTIFACT="${ACTION_TRIGGERS_ARTIFACT:-}"
+      - export ACTION_TRIGGERS_JSON="${ACTION_TRIGGERS_JSON:-/terraform/modules/codepipeline_prodpython/action_triggers.json}"
 
       - |
         artifact_dir() {
@@ -23,7 +21,11 @@ phases:
             printf '%s' "$CODEBUILD_SRC_DIR"
           else
             local var="CODEBUILD_SRC_DIR_${name}"
-            printf '%s' "${!var}"
+            if [ -n "${!var-}" ]; then
+              printf '%s' "${!var}"
+            else
+              printf ''
+            fi
           fi
         }
       - CHANGED_FILES_PATH="$(artifact_dir "$CHANGED_FILES_ARTIFACT")"
@@ -39,27 +41,75 @@ phases:
       - ls -lah "$ACTION_TRIGGERS_PATH" || true
       - test -f "$CHANGED_FILES" && wc -c "$CHANGED_FILES" || echo "missing: $CHANGED_FILES"
       - test -f "$ACTION_TRIGGERS" && wc -c "$ACTION_TRIGGERS" || echo "missing: $ACTION_TRIGGERS"
-      
+
+      # -------- Artifact checks: record and show failing files --------
+      - export ARTIFACT_ERRS=/tmp/artifact_errors.txt
+      - truncate -s 0 "$ARTIFACT_ERRS"
+      - |
+        show_file_for_review() {
+          local p="$1"
+          [ -f "$p" ] || return 0
+          echo "----- BEGIN FILE: $p -----"
+          local lines; lines=$(wc -l < "$p" 2>/dev/null || echo 0)
+          if [ "$lines" -le 200 ]; then
+            sed -n '1,200p' "$p" || true
+          else
+            sed -n '1,120p' "$p" || true
+            echo "----- [snip] -----"
+            tail -n 80 "$p" || true
+          fi
+          echo "----- END FILE: $p -----"
+        }
+        check_json_artifact() {
+          local name="$1" path="$2"
+          if [ -z "${path:-}" ]; then
+            echo "ART_FAIL|$name|unresolved_path||" >> "$ARTIFACT_ERRS"
+            echo "Artifact failure: '$name' has unresolved path"
+            return 1
+          fi
+          if [ ! -f "$path" ]; then
+            echo "ART_FAIL|$name|missing|$path|" >> "$ARTIFACT_ERRS"
+            echo "Artifact failure: '$name' missing at $path"
+            return 1
+          fi
+          if [ ! -s "$path" ]; then
+            echo "ART_FAIL|$name|empty|$path|" >> "$ARTIFACT_ERRS"
+            echo "Artifact failure: '$name' is empty at $path"
+            return 1
+          fi
+          if ! python3 - <<'PY' "$path" 2>/tmp/j.err; then
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8-sig") as f:
+    json.load(f)
+PY
+          then
+            local err; err="$(tr -d '\n' </tmp/j.err | head -c 500 || true)"
+            echo "ART_FAIL|$name|invalid_json|$path|$err" >> "$ARTIFACT_ERRS"
+            echo "Artifact failure: '$name' has invalid JSON at $path"
+            show_file_for_review "$path" || true
+            return 1
+          fi
+          return 0
+        }
+      - check_json_artifact "changed_files" "$CHANGED_FILES" || { echo "{}" > "${CHANGED_FILES}.fallback"; CHANGED_FILES="${CHANGED_FILES}.fallback"; }
+      - check_json_artifact "action_triggers" "$ACTION_TRIGGERS" || { echo "{}" > "${ACTION_TRIGGERS}.fallback"; ACTION_TRIGGERS="${ACTION_TRIGGERS}.fallback"; }
 
       - export FILE_LIST_TXT=/tmp/changed_files.txt
       - |
         python3 - <<'PY'
-        import json, os, sys, glob
-
+        import json, os, glob
         src_dir = os.environ.get("CODEBUILD_SRC_DIR", ".")
         changed_json = os.environ.get("CHANGED_FILES")
         files = []
-
         def flatten(v):
           if isinstance(v, str): return [v]
           if isinstance(v, list): return [x for x in v if isinstance(x, str)]
           if isinstance(v, dict):
             out=[]
-            for k,val in v.items():
+            for _,val in v.items():
               out += flatten(val)
             return out
           return []
-
         if changed_json and os.path.isfile(changed_json) and os.path.getsize(changed_json)>0:
           try:
             with open(changed_json, "r", encoding="utf-8-sig") as f:
@@ -67,12 +117,9 @@ phases:
             files = flatten(data)
           except Exception:
             files = []
-
         if not files:
-          patterns = ["**/*.yml", "**/*.yaml", "**/*.tf"]
-          for pat in patterns:
+          for pat in ["**/*.yml","**/*.yaml","**/*.tf"]:
             files += glob.glob(os.path.join(src_dir, pat), recursive=True)
-
         norm = []
         for p in files:
           p = os.path.normpath(os.path.join(src_dir, p)) if not os.path.isabs(p) else os.path.normpath(p)
@@ -101,12 +148,12 @@ phases:
           terraform -version
         fi
 
+
       - export YAML_ERRS=/tmp/yaml_errors.txt
       - truncate -s 0 "$YAML_ERRS"
       - |
         if [ -s "$YAML_LIST" ]; then
           while IFS= read -r f; do
-            # yamllint "parsable" format: path:line:col: level: message [rule]
             if ! yamllint -f parsable -d "{extends: default, rules: {line-length: {max: 160}, document-start: disable}}" "$f" > /tmp/y.out 2>&1; then
               echo "YAML_FAIL|$f" >> "$YAML_ERRS"
               sed 's/^/  /' /tmp/y.out >> "$YAML_ERRS"
@@ -118,22 +165,18 @@ phases:
       - truncate -s 0 "$TF_ERRS"
       - |
         if [ -s "$TF_LIST" ]; then
-          # Deduplicate directories containing changed .tf files
           mapfile -t TF_DIRS < <(awk -F/ 'NF{NF--;print}' "$TF_LIST" | sed 's#^$#.#' | sort -u)
           for d in "${TF_DIRS[@]}"; do
             echo "Checking Terraform in: $d"
-            # init without touching backends
             if ! terraform -chdir="$d" init -backend=false -input=false -no-color >/tmp/tf_init.out 2>&1; then
               echo "TF_FAIL|$d|init" >> "$TF_ERRS"
               sed 's/^/  /' /tmp/tf_init.out >> "$TF_ERRS"
               continue
             fi
-            # validate syntax and providers
             if ! terraform -chdir="$d" validate -no-color >/tmp/tf_val.out 2>&1; then
               echo "TF_FAIL|$d|validate" >> "$TF_ERRS"
               sed 's/^/  /' /tmp/tf_val.out >> "$TF_ERRS"
             fi
-            # style check (optional but useful)
             if ! terraform -chdir="$d" fmt -check -no-color >/tmp/tf_fmt.out 2>&1; then
               echo "TF_FAIL|$d|fmt" >> "$TF_ERRS"
               sed 's/^/  /' /tmp/tf_fmt.out >> "$TF_ERRS"
@@ -144,17 +187,25 @@ phases:
       - truncate -s 0 "$OUTPUT_ARTIFACT_PATH"
       - |
         python3 - <<'PY'
-        import json, os, re
-        out = {"yaml_failed": [], "terraform_failed": [], "summary": {}}
-
-        def read(path):
+        import json, os
+        out = {"artifact_failures": [], "yaml_failed": [], "terraform_failed": [], "summary": {}}
+        def read_lines(path):
           if not os.path.isfile(path) or os.path.getsize(path)==0:
             return []
-          with open(path,"r") as f:
+          with open(path,"r",encoding="utf-8") as f:
             return f.read().splitlines()
-
+        # Artifact failures
+        for line in read_lines(os.environ.get("ARTIFACT_ERRS","/tmp/artifact_errors.txt")):
+          if not line.startswith("ART_FAIL|"): continue
+          parts = line.split("|", 4)
+          out["artifact_failures"].append({
+            "artifact": parts[1] if len(parts)>1 else "",
+            "reason":   parts[2] if len(parts)>2 else "",
+            "path":     parts[3] if len(parts)>3 else "",
+            "detail":   parts[4] if len(parts)>4 else "",
+          })
         # YAML failures
-        y = read(os.environ.get("YAML_ERRS","/tmp/yaml_errors.txt"))
+        y = read_lines(os.environ.get("YAML_ERRS","/tmp/yaml_errors.txt"))
         cur = None
         for line in y:
           if line.startswith("YAML_FAIL|"):
@@ -166,9 +217,8 @@ phases:
               cur["errors"].append(line.strip())
         for item in out["yaml_failed"]:
           item["errors"] = "\n".join(item["errors"])
-
         # Terraform failures
-        t = read(os.environ.get("TF_ERRS","/tmp/tf_errors.txt"))
+        t = read_lines(os.environ.get("TF_ERRS","/tmp/tf_errors.txt"))
         cur = None
         for line in t:
           if line.startswith("TF_FAIL|"):
@@ -180,12 +230,12 @@ phases:
               cur["errors"].append(line.strip())
         for item in out["terraform_failed"]:
           item["errors"] = "\n".join(item["errors"])
-
         out["summary"] = {
+          "artifact_failed_count": len(out["artifact_failures"]),
           "yaml_failed_count": len(out["yaml_failed"]),
           "terraform_failed_count": len(out["terraform_failed"]),
         }
-        with open(os.environ.get("OUTPUT_ARTIFACT_PATH","actions_required.json"),"w") as f:
+        with open(os.environ.get("OUTPUT_ARTIFACT_PATH","actions_required.json"),"w",encoding="utf-8") as f:
           json.dump(out, f, indent=2)
         PY
 

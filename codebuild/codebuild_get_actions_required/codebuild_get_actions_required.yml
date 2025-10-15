@@ -6,26 +6,193 @@ env:
 phases:
   build:
     commands:
-      - set -e
-      - echo getting required actions...
-      - CHANGED_FILES_VAR="CODEBUILD_SRC_DIR_${CHANGED_FILES_ARTIFACT}"
-      - CHANGED_FILES_VAR=$(echo $CHANGED_FILES_VAR | sed s/_$//)
-      - CHANGED_FILES_PATH=${!CHANGED_FILES_VAR}
-      - CHANGED_FILES="${CHANGED_FILES_PATH}${CHANGED_FILES_JSON}"
-      - ACTION_TRIGGERS_VAR="CODEBUILD_SRC_DIR_${ACTION_TRIGGERS_ARTIFACT}"
-      - ACTION_TRIGGERS_VAR=$(echo $ACTION_TRIGGERS_VAR | sed s/_$//)
-      - ACTION_TRIGGERS_PATH=${!ACTION_TRIGGERS_VAR}
-      - ACTION_TRIGGERS="${ACTION_TRIGGERS_PATH}${ACTION_TRIGGERS_JSON}"
-      - echo $CHANGED_FILES_VAR
-      - echo $ACTION_TRIGGERS_VAR
-      - echo $CHANGED_FILES_PATH
-      - echo $ACTION_TRIGGERS_PATH
-      - echo $CHANGED_FILES
-      - echo $ACTION_TRIGGERS
-      - get_actions_required.py -c $CHANGED_FILES -t $ACTION_TRIGGERS -o $OUTPUT_ARTIFACT_PATH
-      - mv $OUTPUT_ARTIFACT_PATH /opt/$OUTPUT_ARTIFACT_PATH
-      - ls /opt
-      - cat /opt/$OUTPUT_ARTIFACT_PATH
+      - set -euo pipefail
+      - echo "getting required actions..."
+
+      - : "${OUTPUT_ARTIFACT_PATH:=actions_required.json}"
+      - : "${CHANGED_FILES_ARTIFACT:=changed_files}"
+      - : "${CHANGED_FILES_JSON:=/changed_files.json}"
+      - : "${ACTION_TRIGGERS_ARTIFACT:=}"
+      - : "${ACTION_TRIGGERS_JSON:=/terraform/modules/codepipeline_prodpython/action_triggers.json}"
+
+
+      - |
+        artifact_dir() {
+          local name="$1"
+          if [ -z "$name" ]; then
+            printf '%s' "$CODEBUILD_SRC_DIR"
+          else
+            local var="CODEBUILD_SRC_DIR_${name}"
+            printf '%s' "${!var}"
+          fi
+        }
+      - CHANGED_FILES_PATH="$(artifact_dir "$CHANGED_FILES_ARTIFACT")"
+      - ACTION_TRIGGERS_PATH="$(artifact_dir "$ACTION_TRIGGERS_ARTIFACT")"
+      - CHANGED_FILES="${CHANGED_FILES_PATH%/}${CHANGED_FILES_JSON}"
+      - ACTION_TRIGGERS="${ACTION_TRIGGERS_PATH%/}${ACTION_TRIGGERS_JSON}"
+
+      - echo "CHANGED_FILES_PATH=$CHANGED_FILES_PATH"
+      - echo "ACTION_TRIGGERS_PATH=$ACTION_TRIGGERS_PATH"
+      - echo "CHANGED_FILES=$CHANGED_FILES"
+      - echo "ACTION_TRIGGERS=$ACTION_TRIGGERS"
+      - ls -lah "$CHANGED_FILES_PATH" || true
+      - ls -lah "$ACTION_TRIGGERS_PATH" || true
+      - test -f "$CHANGED_FILES" && wc -c "$CHANGED_FILES" || echo "missing: $CHANGED_FILES"
+      - test -f "$ACTION_TRIGGERS" && wc -c "$ACTION_TRIGGERS" || echo "missing: $ACTION_TRIGGERS"
+      
+
+      - export FILE_LIST_TXT=/tmp/changed_files.txt
+      - |
+        python3 - <<'PY'
+        import json, os, sys, glob
+
+        src_dir = os.environ.get("CODEBUILD_SRC_DIR", ".")
+        changed_json = os.environ.get("CHANGED_FILES")
+        files = []
+
+        def flatten(v):
+          if isinstance(v, str): return [v]
+          if isinstance(v, list): return [x for x in v if isinstance(x, str)]
+          if isinstance(v, dict):
+            out=[]
+            for k,val in v.items():
+              out += flatten(val)
+            return out
+          return []
+
+        if changed_json and os.path.isfile(changed_json) and os.path.getsize(changed_json)>0:
+          try:
+            with open(changed_json, "r", encoding="utf-8-sig") as f:
+              data = json.loads(f.read().strip() or "[]")
+            files = flatten(data)
+          except Exception:
+            files = []
+
+        if not files:
+          patterns = ["**/*.yml", "**/*.yaml", "**/*.tf"]
+          for pat in patterns:
+            files += glob.glob(os.path.join(src_dir, pat), recursive=True)
+
+        norm = []
+        for p in files:
+          p = os.path.normpath(os.path.join(src_dir, p)) if not os.path.isabs(p) else os.path.normpath(p)
+          if os.path.isfile(p):
+            norm.append(p)
+        norm = sorted(set(norm))
+        with open("/tmp/changed_files.txt","w") as out:
+          out.write("\n".join(norm))
+        PY
+      - echo "Candidate files:"
+      - sed -n '1,200p' "$FILE_LIST_TXT" || true
+
+      - export YAML_LIST=/tmp/yaml_files.txt
+      - export TF_LIST=/tmp/tf_files.txt
+      - grep -Ei '\.(yml|yaml)$' "$FILE_LIST_TXT" > "$YAML_LIST" || true
+      - grep -Ei '\.tf$' "$FILE_LIST_TXT" > "$TF_LIST" || true
+
+      - export PATH="$HOME/.local/bin:$PATH"
+      - pip3 install --user --quiet yamllint || pip install --user --quiet yamllint
+      - |
+        if ! command -v terraform >/dev/null 2>&1; then
+          TF_VERSION="${TF_VERSION:-1.6.6}"
+          echo "Installing Terraform ${TF_VERSION}..."
+          curl -sSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+          unzip -o /tmp/terraform.zip -d /usr/local/bin
+          terraform -version
+        fi
+
+      - export YAML_ERRS=/tmp/yaml_errors.txt
+      - truncate -s 0 "$YAML_ERRS"
+      - |
+        if [ -s "$YAML_LIST" ]; then
+          while IFS= read -r f; do
+            # yamllint "parsable" format: path:line:col: level: message [rule]
+            if ! yamllint -f parsable -d "{extends: default, rules: {line-length: {max: 160}, document-start: disable}}" "$f" > /tmp/y.out 2>&1; then
+              echo "YAML_FAIL|$f" >> "$YAML_ERRS"
+              sed 's/^/  /' /tmp/y.out >> "$YAML_ERRS"
+            fi
+          done < "$YAML_LIST"
+        fi
+
+      - export TF_ERRS=/tmp/tf_errors.txt
+      - truncate -s 0 "$TF_ERRS"
+      - |
+        if [ -s "$TF_LIST" ]; then
+          # Deduplicate directories containing changed .tf files
+          mapfile -t TF_DIRS < <(awk -F/ 'NF{NF--;print}' "$TF_LIST" | sed 's#^$#.#' | sort -u)
+          for d in "${TF_DIRS[@]}"; do
+            echo "Checking Terraform in: $d"
+            # init without touching backends
+            if ! terraform -chdir="$d" init -backend=false -input=false -no-color >/tmp/tf_init.out 2>&1; then
+              echo "TF_FAIL|$d|init" >> "$TF_ERRS"
+              sed 's/^/  /' /tmp/tf_init.out >> "$TF_ERRS"
+              continue
+            fi
+            # validate syntax and providers
+            if ! terraform -chdir="$d" validate -no-color >/tmp/tf_val.out 2>&1; then
+              echo "TF_FAIL|$d|validate" >> "$TF_ERRS"
+              sed 's/^/  /' /tmp/tf_val.out >> "$TF_ERRS"
+            fi
+            # style check (optional but useful)
+            if ! terraform -chdir="$d" fmt -check -no-color >/tmp/tf_fmt.out 2>&1; then
+              echo "TF_FAIL|$d|fmt" >> "$TF_ERRS"
+              sed 's/^/  /' /tmp/tf_fmt.out >> "$TF_ERRS"
+            fi
+          done
+        fi
+
+      - truncate -s 0 "$OUTPUT_ARTIFACT_PATH"
+      - |
+        python3 - <<'PY'
+        import json, os, re
+        out = {"yaml_failed": [], "terraform_failed": [], "summary": {}}
+
+        def read(path):
+          if not os.path.isfile(path) or os.path.getsize(path)==0:
+            return []
+          with open(path,"r") as f:
+            return f.read().splitlines()
+
+        # YAML failures
+        y = read(os.environ.get("YAML_ERRS","/tmp/yaml_errors.txt"))
+        cur = None
+        for line in y:
+          if line.startswith("YAML_FAIL|"):
+            _, fpath = line.split("|",1)
+            cur = {"file": fpath, "errors": []}
+            out["yaml_failed"].append(cur)
+          else:
+            if cur is not None and line.strip():
+              cur["errors"].append(line.strip())
+        for item in out["yaml_failed"]:
+          item["errors"] = "\n".join(item["errors"])
+
+        # Terraform failures
+        t = read(os.environ.get("TF_ERRS","/tmp/tf_errors.txt"))
+        cur = None
+        for line in t:
+          if line.startswith("TF_FAIL|"):
+            _, dpath, stage = line.split("|",2)
+            cur = {"dir": dpath, "stage": stage, "errors": []}
+            out["terraform_failed"].append(cur)
+          else:
+            if cur is not None and line.strip():
+              cur["errors"].append(line.strip())
+        for item in out["terraform_failed"]:
+          item["errors"] = "\n".join(item["errors"])
+
+        out["summary"] = {
+          "yaml_failed_count": len(out["yaml_failed"]),
+          "terraform_failed_count": len(out["terraform_failed"]),
+        }
+        with open(os.environ.get("OUTPUT_ARTIFACT_PATH","actions_required.json"),"w") as f:
+          json.dump(out, f, indent=2)
+        PY
+
+      - mkdir -p /opt
+      - mv "$OUTPUT_ARTIFACT_PATH" "/opt/$OUTPUT_ARTIFACT_PATH"
+      - echo "Actions report:"
+      - cat "/opt/$OUTPUT_ARTIFACT_PATH"
 
 artifacts:
   name: ActionsRequired
